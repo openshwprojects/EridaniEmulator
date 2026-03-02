@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-HP OfficeJet "Eridani" ARM926EJ-S Emulator
+HP OfficeJet "Eridani" ARMv5 Emulator
 ==========================================
 Emulates the boot sequence of the HP OfficeJet printer firmware
 from the SPI flash dump.
@@ -28,9 +28,7 @@ import time
 # Constants
 # ============================================================
 FLASH_FILE = 'readResult_GenericSPI_2026-28-2-14-13-42.bin'
-FLASH_SIZE = 0x100000   # Use first 1MB copy
-RAM_BASE = 0x20000000
-RAM_SIZE = 0x00100000   # 1MB SRAM
+FLASH_SIZE = 0x800000   # 8MB SPI flash (full dump)
 PERIPH_BASE = 0x40000000
 
 # ARM Registers
@@ -78,12 +76,22 @@ class ClockPLL:
       +0x08: PLL enable / config
       +0x0A: Control / trigger (write triggers reconfiguration)
       +0x0C: Status register 1 (bit 0: PLL busy, 0=ready)
-      +0x0E: Status register 2 (bits 0-1: PLL lock, both set=locked)
+      +0x0E: Status register 2 (bits 0-1: PLL lock status)
+    
+    Boot polling sequence:
+      Phase 1 — Wait-busy loop: reads +0x0E, checks bit 0, loops while bit 0 IS set.
+                Needs bit 0 = 0 to exit  → 0x0000
+      Phase 2 — After config write, wait-lock loop: reads +0x0E, checks bits 0-1,
+                loops while bits != 0x03.  Needs bits 0-1 = 11b to exit → 0x0003
+    
+    We track writes: after the first write to any register, return 0x0003 (locked).
+    Before any write, return 0x0000 (not-busy, for phase-1 escape).
     """
     def __init__(self, name, base_addr):
         self.name = name
         self.base = base_addr
         self.regs = [0] * 8  # 8 x 16-bit registers
+        self.write_count = 0  # counts writes to trigger lock transition
     
     def read(self, offset, size):
         idx = (offset & 0xF) >> 1
@@ -91,11 +99,15 @@ class ClockPLL:
             return 0
         
         if offset & 0xF == 0x0C:
-            # Status 1: bit 0 = busy. Always 0 (PLL ready instantly)
+            # Status 1: bit 0 = PLL busy. Always 0 (ready instantly).
             return 0x0000
         elif offset & 0xF == 0x0E:
-            # Status 2: bits 0-1 = lock. Both set = locked
-            return 0x0003
+            # Status 2: phase-dependent.
+            # Before config: 0x0000 (bit0=0) → phase-1 (wait-busy) exits immediately
+            # After config:  0x0003 (bits 0-1 set = locked) → phase-2 (wait-lock) exits
+            if self.write_count > 0:
+                return 0x0003   # PLL locked
+            return 0x0000       # not yet started, but also not busy
         
         return self.regs[idx]
     
@@ -103,6 +115,7 @@ class ClockPLL:
         idx = (offset & 0xF) >> 1
         if idx < len(self.regs):
             self.regs[idx] = value & 0xFFFF
+        self.write_count += 1
 
 
 # ============================================================
@@ -206,7 +219,7 @@ class Memory:
         self.clk0 = ClockPLL("CLK0", 0x20813500)
         self.clk1 = ClockPLL("CLK1", 0x20813A00)
         
-        # UART - at 0x20812900 (reverse-engineered from putchar literal pool)
+        # UART - at 0x20812900
         #   +0x06: TX data (STRH char here)
         #   +0x0E: Status (bit 9 = TX busy, 0=ready)
         self.uart = EridaniUART("UART", 0x20812900)
@@ -215,6 +228,9 @@ class Memory:
         self.gpio = GenericMMIO("GPIO", 0x20813200, 0x100)
         self.iomux = GenericMMIO("IOMUX", 0x20812000, 0x900)  # Below UART
         self.misc = GenericMMIO("MISC", 0x2081B000, 0x1000)
+        # Discovered via I/O log during emulation
+        self.sysctl = GenericMMIO("SYSCTL", 0x20813000, 0x200)
+        self.dma = GenericMMIO("DMA", 0x2081F000, 0x1000)
         
         # Register all peripherals (order matters: more specific first)
         self._register_periph(0x20813500, 0x10, self.clk0)
@@ -223,6 +239,8 @@ class Memory:
         self._register_periph(0x20813200, 0x100, self.gpio)
         self._register_periph(0x20812000, 0x900, self.iomux)  # Don't overlap UART
         self._register_periph(0x2081B000, 0x1000, self.misc)
+        self._register_periph(0x20813000, 0x200, self.sysctl)
+        self._register_periph(0x2081F000, 0x1000, self.dma)
     
     def _register_periph(self, base, size, device):
         self.peripherals[(base, size)] = device
@@ -250,11 +268,14 @@ class Memory:
                 return name, reg
         return None, None
     
+    # Flash region names that require big-endian byte-order for instruction/data reads
+    FLASH_NAMES = frozenset(('flash', 'flash_mirror', 'flash_d_alias', 'flash_f_alias'))
+    
     def read32(self, addr):
         name, reg = self._find_region(addr)
         if reg:
             offset = addr - reg['base']
-            if self.big_endian_flash and name in ('flash', 'flash_mirror'):
+            if self.big_endian_flash and name in self.FLASH_NAMES:
                 return struct.unpack_from('>I', reg['data'], offset)[0]
             return struct.unpack_from('<I', reg['data'], offset)[0]
         return self._periph_read(addr, 4)
@@ -263,7 +284,7 @@ class Memory:
         name, reg = self._find_region(addr)
         if reg:
             offset = addr - reg['base']
-            if self.big_endian_flash and name in ('flash', 'flash_mirror'):
+            if self.big_endian_flash and name in self.FLASH_NAMES:
                 return struct.unpack_from('>H', reg['data'], offset)[0]
             return struct.unpack_from('<H', reg['data'], offset)[0]
         return self._periph_read(addr, 2) & 0xFFFF
@@ -321,18 +342,20 @@ class Memory:
 # ============================================================
 # ARM CPU
 # ============================================================
-class ARM926:
-    """ARM926EJ-S CPU emulator."""
+class ARMv5:
+    """ARMv5 CPU emulator."""
     
     def __init__(self, memory):
         self.mem = memory
         self.regs = [0] * 17  # R0-R15 + CPSR
         self.regs[CPSR] = 0xD3  # Supervisor mode, IRQ/FIQ disabled
         self.cp15 = [0] * 16  # CP15 registers (simplified)
-        self.cp15[0] = 0x41069265  # ARM926EJ-S Main ID
+        self.cp15[0] = 0x41069265  # ARMv5 Main ID (value is a placeholder)
         self.halted = False
         self.trace = False
         self.instr_count = 0
+        self.arm_count = 0
+        self.thumb_count = 0
         self.max_instr = 500000
         self.breakpoints = set()
         
@@ -565,7 +588,7 @@ class ARM926:
             self.pc += 4
             return
         
-        # ---- Halfword transfers ----
+        # ---- Halfword / Doubleword transfers (LDRH/STRH/LDRSB/LDRSH/LDRD/STRD) ----
         if (word & 0x0E000090) == 0x00000090 and bit7 and bit4:
             sh = (word >> 5) & 3
             if sh == 0:
@@ -579,41 +602,50 @@ class ARM926:
             w = bit21
             
             # Calculate offset
-            if bit22:  # Immediate
+            if bit22:  # Immediate offset
                 imm_hi = (word >> 8) & 0xF
                 imm_lo = word & 0xF
                 off = (imm_hi << 4) | imm_lo
-            else:
+            else:  # Register offset
                 off = self.regs[rm]
             
             rn_val = self.regs[rn]
             if rn == PC:
                 rn_val += 8
             
-            addr = rn_val + (off if u else -off) if p else rn_val
+            addr = (rn_val + (off if u else -off)) if p else rn_val
+            addr &= 0xFFFFFFFF
             
             if l:  # Load
-                if sh == 1:  # LDRH
+                if sh == 1:  # LDRH — unsigned halfword
                     val = self.mem.read16(addr)
-                elif sh == 2:  # LDRSB
+                    self.regs[rd] = val & 0xFFFFFFFF
+                elif sh == 2:  # LDRSB — signed byte
                     val = self.mem.read8(addr)
                     if val & 0x80:
                         val |= 0xFFFFFF00
-                elif sh == 3:  # LDRSH
+                    self.regs[rd] = val & 0xFFFFFFFF
+                elif sh == 3:  # LDRSH — signed halfword
                     val = self.mem.read16(addr)
                     if val & 0x8000:
                         val |= 0xFFFF0000
-                else:
-                    val = 0
-                self.regs[rd] = val & 0xFFFFFFFF
+                    self.regs[rd] = val & 0xFFFFFFFF
             else:  # Store
-                if sh == 1:  # STRH
+                if sh == 1:  # STRH — store halfword
                     self.mem.write16(addr, self.regs[rd] & 0xFFFF)
-                else:
+                elif sh == 2:  # LDRD used as load (S=1,H=0,L=0 → LDRD in ARMv5)
+                    # ARMv5: LDRD encodes as L=0,S=1,H=0 — treat as LDRD
+                    self.regs[rd] = self.mem.read32(addr)
+                    if rd < 15:
+                        self.regs[rd + 1] = self.mem.read32(addr + 4)
+                elif sh == 3:  # STRD — store doubleword (Rd and Rd+1)
                     self.mem.write32(addr, self.regs[rd])
+                    if rd < 15:
+                        self.mem.write32(addr + 4, self.regs[rd + 1])
             
+            # Writeback
             if not p:
-                addr = rn_val + (off if u else -off)
+                addr = (rn_val + (off if u else -off)) & 0xFFFFFFFF
             if (p and w) or not p:
                 self.regs[rn] = addr & 0xFFFFFFFF
             
@@ -1326,8 +1358,8 @@ class ARM926:
             print(f"  UNHANDLED THUMB: 0x{hw:04X}")
         self.pc += 2
     
+
     def step(self):
-        """Execute one instruction. No hacks - proper peripheral emulation."""
         if self.halted:
             return False
         
@@ -1353,14 +1385,25 @@ class ARM926:
             return False
         
         self.instr_count += 1
+        if thumb:
+            self.thumb_count += 1
+        else:
+            self.arm_count += 1
         
-        # Detect infinite loops
-        if self.pc == pc and not thumb:
-            word = self.mem.read32(pc)
-            if word == 0xEAFFFFFE:  # B .
-                print(f"\n[CPU] Infinite loop detected at 0x{pc:08X}")
-                self.halted = True
-                return False
+        # Detect infinite loops (ARM: B . and Thumb: B . )
+        if self.pc == pc:
+            if not thumb:
+                word = self.mem.read32(pc)
+                if word == 0xEAFFFFFE:  # ARM B .
+                    print(f"\n[CPU] Infinite loop detected at 0x{pc:08X}")
+                    self.halted = True
+                    return False
+            else:
+                hw = self.mem.read16(pc)
+                if hw == 0xE7FE:  # Thumb B .
+                    print(f"\n[CPU] Infinite loop detected at 0x{pc:08X} (Thumb)")
+                    self.halted = True
+                    return False
         
         if self.instr_count >= self.max_instr:
             print(f"\n[CPU] Max instructions ({self.max_instr}) reached")
@@ -1401,7 +1444,7 @@ class ARM926:
     def run(self):
         """Run until halted."""
         print(f"\n{'='*60}")
-        print(f"  HP OfficeJet 'Eridani' ARM926EJ-S Emulator")
+        print(f"  HP OfficeJet 'Eridani' ARMv5 Emulator")
         print(f"  Starting execution at PC=0x{self.pc:08X}")
         print(f"{'='*60}\n")
         
@@ -1417,6 +1460,7 @@ class ARM926:
         
         print(f"\n{'='*60}")
         print(f"  Emulation stopped after {self.instr_count:,} instructions")
+        print(f"  ARM: {self.arm_count:,}  Thumb: {self.thumb_count:,}")
         print(f"  Elapsed time: {elapsed:.3f}s")
         if elapsed > 0:
             print(f"  Speed: {self.instr_count/elapsed:,.0f} instructions/sec")
@@ -1454,7 +1498,7 @@ class ARM926:
 # Main
 # ============================================================
 def main():
-    parser = argparse.ArgumentParser(description='HP OfficeJet ARM926 Emulator')
+    parser = argparse.ArgumentParser(description='HP OfficeJet ARMv5 Emulator')
     parser.add_argument('--trace', action='store_true', help='Enable instruction trace')
     parser.add_argument('--max', type=int, default=500000, help='Max instructions')
     parser.add_argument('--dump', type=int, default=0, help='Dump registers every N instructions')
@@ -1472,39 +1516,37 @@ def main():
     
     print(f"  Loaded {len(flash_data):,} bytes ({len(flash_data)/1024:.0f} KB)")
     
-    # Verify "otto" magic
-    if flash_data[0x0C:0x10] == b'otto':
-        print("  [OK] 'otto' magic found at offset 0x0C")
-    else:
-        print("  [WARN] 'otto' magic not found!")
-    
     # Setup memory
     mem = Memory()
-    mem.add_region(0x00000000, FLASH_SIZE, flash_data, 'flash', writable=False)
-    mem.add_region(RAM_BASE, RAM_SIZE, name='ram', writable=True)
-    # Mirror flash at high address range (boot code jumps to 0xE0001C)
-    mem.add_region(0x00E00000, FLASH_SIZE, flash_data, 'flash_mirror', writable=False)
-    # SRAM at 0xFC000000 (used by boot code for memory test, needs 8MB)
+    # Flash — full 8MB at 0x00000000 (writable: boot code zeroes BSS at 0x0)
+    mem.add_region(0x00000000, FLASH_SIZE, flash_data, 'flash', writable=True)
+    
+    # HP Eridani flash aliases — the 1MB boot ROM block (flash[0:0x100000]) appears at:
+    # 0x00D00000: boot ROM services (LR=0x00DFF7F2 references this alias)
+    # 0x00E00000: execution mirror (reset vector jumps here)
+    # 0x00F00000: ROMOBJ table scan (R5=0xF460D4 → offset 0x460D4 within this alias)
+    boot_block = flash_data[0:0x100000]  # first 1MB = boot ROM
+    mem.add_region(0x00D00000, 0x100000, boot_block, 'flash_d_alias', writable=False)
+    mem.add_region(0x00E00000, 0x100000, boot_block, 'flash_mirror',  writable=False)
+    mem.add_region(0x00F00000, 0x100000, boot_block, 'flash_f_alias', writable=False)
+    
+    # SRAM regions
     mem.add_region(0xFC000000, 0x00800000, name='sram_hi', writable=True)
-    # SRAM at 0xFD000000 (boot code uses for stack + ROMOBJ copy dest)
-    mem.add_region(0xFD000000, 0x00400000, name='sram_fd', writable=True)
-    # SRAM at 0xFE000000 (firmware data area)
-    mem.add_region(0xFE000000, 0x00200000, name='sram_fe', writable=True)
+    mem.add_region(0xFD000000, 0x00800000, name='sram_fd', writable=True)
+    mem.add_region(0xFE000000, 0x00400000, name='sram_fe', writable=True)
     
     # Create CPU
-    cpu = ARM926(mem)
+    cpu = ARMv5(mem)
     cpu.trace = args.trace
     cpu.max_instr = args.max
     cpu.reset()
-    
-    # Set initial SP to top of RAM
-    cpu.regs[SP] = RAM_BASE + RAM_SIZE - 4
+
     
     print(f"  Memory map:")
-    print(f"    Flash:  0x00000000 - 0x{FLASH_SIZE-1:08X} ({FLASH_SIZE//1024} KB)")
-    print(f"    Mirror: 0x00E00000 - 0x00EFFFFF ({FLASH_SIZE//1024} KB)")
-    print(f"    RAM:    0x{RAM_BASE:08X} - 0x{RAM_BASE+RAM_SIZE-1:08X} ({RAM_SIZE//1024} KB)")
-    print(f"    SRAM:   0xFC000000 - 0xFD0FFFFF (2 MB)")
+    print(f"    Flash:  0x00000000 - 0x{FLASH_SIZE-1:08X} ({FLASH_SIZE//1024//1024} MB)")
+    print(f"    Mirror: 0x00E00000 - 0x00EFFFFF (1 MB boot mirror)")
+
+    print(f"    SRAM:   0xFC000000 - 0xFEFFFFFF (8+8+4 MB)")
     print(f"  Peripherals:")
     print(f"    CLK0:   0x20813500 (Clock/PLL controller 0)")
     print(f"    CLK1:   0x20813A00 (Clock/PLL controller 1)")
