@@ -28,7 +28,7 @@ import time
 # Constants
 # ============================================================
 FLASH_FILE = 'readResult_GenericSPI_2026-28-2-14-13-42.bin'
-FLASH_SIZE = 0x800000   # 8MB SPI flash (full dump)
+FLASH_SIZE = 0x100000   # 1MB SPI flash (8Mbit)
 PERIPH_BASE = 0x40000000
 
 # ARM Registers
@@ -1518,7 +1518,7 @@ def main():
     
     # Setup memory
     mem = Memory()
-    # Flash — full 8MB at 0x00000000 (writable: boot code zeroes BSS at 0x0)
+    # Flash — 1MB at 0x00000000 (writable: boot code zeroes BSS at 0x0)
     mem.add_region(0x00000000, FLASH_SIZE, flash_data, 'flash', writable=True)
     
     # HP Eridani flash aliases — the 1MB boot ROM block (flash[0:0x100000]) appears at:
@@ -1543,7 +1543,7 @@ def main():
 
     
     print(f"  Memory map:")
-    print(f"    Flash:  0x00000000 - 0x{FLASH_SIZE-1:08X} ({FLASH_SIZE//1024//1024} MB)")
+    print(f"    Flash:  0x00000000 - 0x{FLASH_SIZE-1:08X} ({FLASH_SIZE//1024} KB)")
     print(f"    Mirror: 0x00E00000 - 0x00EFFFFF (1 MB boot mirror)")
 
     print(f"    SRAM:   0xFC000000 - 0xFEFFFFFF (8+8+4 MB)")
